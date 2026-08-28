@@ -1,0 +1,5 @@
+node_modules/
+dist/
+# Built from ../../mpc/wallet-mpc by scripts/build-wasm.sh, and by CI before publishing. A 400 KB
+# binary that a command regenerates does not belong in the history.
+wasm/
