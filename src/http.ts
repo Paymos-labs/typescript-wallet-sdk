@@ -28,13 +28,30 @@ import {
 /** The sign/aggregate round can trigger a relay that takes a while. */
 const DEFAULT_TIMEOUT_MS = 60_000;
 
+/** Longest stretch of a non-JSON body quoted into an error message. */
+const TEXT_SNIPPET = 200;
+
+/**
+ * A body that is not JSON at all — a proxy's 404 page, a load balancer's 502 — is not the wallet
+ * API talking. Quoting a whole HTML document into an exception helps nobody; saying what it was
+ * and where to look does.
+ */
+function describeNonJson(status: number, text: string): string {
+	const t = text.trim();
+	if (!t) return `request failed with status ${status}`;
+	if (t.startsWith('<')) {
+		return `request failed with status ${status}: the response is an HTML page, not the wallet API — check the base URL`;
+	}
+	return t.length > TEXT_SNIPPET ? `${t.slice(0, TEXT_SNIPPET)}…` : t;
+}
+
 function messageOf(body: unknown, status: number, text: string): string {
 	if (body && typeof body === 'object') {
 		const o = body as Record<string, unknown>;
-		const msg = o.error ?? o.detail;
+		const msg = o.error || o.detail;
 		if (typeof msg === 'string' && msg) return msg;
 	}
-	return text.trim() || `request failed with status ${status}`;
+	return describeNonJson(status, text);
 }
 
 /** Map a 400's message to a type. First match wins, in this exact order. */
@@ -60,8 +77,9 @@ function raiseFor(status: number, body: unknown, text: string, retryAfterHeader:
 	if (status === 403) throw new Forbidden(message, status);
 	if (status === 409) throw new Conflict(message, status);
 	if (status === 429) {
-		const parsed = retryAfterHeader === null ? Number.NaN : Number.parseInt(retryAfterHeader, 10);
-		throw new RateLimited(message, status, Number.isInteger(parsed) ? parsed : undefined);
+		// Delta-seconds only, like Python's int(): "12abc" or an HTTP-date is not a number of seconds.
+		const raw = retryAfterHeader?.trim() ?? '';
+		throw new RateLimited(message, status, /^\d+$/.test(raw) ? Number(raw) : undefined);
 	}
 	if (status === 400) throw new (classify400(message))(message, status);
 	// 404 has no type of its own by design; it and every other non-2xx land on the base error.
@@ -105,14 +123,32 @@ export class Http {
 			clearTimeout(timer);
 		}
 
-		const text = await response.text();
+		let text: string;
+		try {
+			text = await response.text();
+		} catch (e) {
+			throw new PaymosError(`transport error: ${(e as Error).message}`, response.status);
+		}
 		let body: unknown = null;
+		let parsed = !text;
 		try {
 			body = text ? JSON.parse(text) : null;
+			parsed = true;
 		} catch {
 			body = null;
 		}
-		if (response.status >= 200 && response.status < 300) return body;
+		if (response.status >= 200 && response.status < 300) {
+			// A 2xx that is not JSON is somebody else's page answering on the wallet's path. Returning
+			// null here is how a caller ends up with a TypeError three frames later instead of this.
+			if (!parsed) {
+				const what = describeNonJson(response.status, text);
+				throw new PaymosError(
+					what.startsWith('request failed') ? what : `expected JSON from the wallet API, got: ${what}`,
+					response.status
+				);
+			}
+			return body;
+		}
 		raiseFor(response.status, body, text, response.headers.get('retry-after'));
 	}
 

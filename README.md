@@ -12,7 +12,8 @@ can move funds** — every swap and withdrawal is co-signed, and your half never
   breakdown you see *before* signing anything.
 - **Never blind-signs** — the server discloses each message it wants signed; this SDK recomputes the
   digest and refuses unless the package binds to exactly that message, from your vault, for no more
-  than the debit you approved.
+  than the quote's debit, moving a token that matches the send asset's fingerprint. What it does not
+  check is below.
 
 ```bash
 npm install @paymos/wallet
@@ -28,11 +29,11 @@ for (const b of await wallet.balances()) {
 }
 
 // A preview. Nothing is created and nothing is signed.
-const quote = await wallet.quoteSwap('usdt.tron', 'usdc.sol', '100');
-console.log(quote.receive.amount, 'guaranteed at least', quote.receive.min);
+const quote = await wallet.quoteSwap('USDT@tron', 'USDC@base', '100');
+console.log(quote.receive.amount, 'quoted, at least', quote.receive.min);
 
 // The real thing, with a floor and a ceiling you choose.
-const movement = await wallet.swap('usdt.tron', 'usdc.sol', '100', {
+const movement = await wallet.swap('USDT@tron', 'USDC@base', '100', {
   minReceive: '99.5',
   maxDebit: '100.5',
   idempotencyKey: myJobId   // a retry replays the same movement instead of paying twice
@@ -102,8 +103,20 @@ your half of the signature exists.
 
 No, and this is the part worth reading twice. The server discloses the exact message it wants
 signed; the SDK recomputes the digest itself and refuses unless that message belongs to your vault,
-moves no more than the debit you approved, and matches the request you made. A server asking for
-anything else gets a refusal, not a signature.
+moves no more than the quote's debit, and the quote matches the request you made.
+
+Know the limits. The recipient of each transfer is the route's deposit address, chosen by the
+server, and the SDK does not check it. "No more than the debit" is bounded by the quote's debit,
+and for an `exact_out` withdraw that debit is computed by the server — pass `maxDebit` to make it
+your number; for any unattended payout, do.
+
+The token each transfer moves is checked too: its hash must match the send asset's `fingerprint`
+from `assets()`. That fingerprint is published by the same server that builds the messages, so it
+catches a server bug or a compromised signing path, not a server that lies in both places. For a
+trust anchor independent of the server, pin the fingerprints yourself —
+`new Wallet(secret, { pinnedFingerprints: { 'USDC@base': '<sha-256 hex>' } })` (a string or a list
+per label). A pinned label is checked against only your values; the others use what the server
+publishes.
 
 ### Which networks and assets are supported?
 

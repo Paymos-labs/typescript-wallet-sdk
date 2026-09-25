@@ -5,6 +5,7 @@
  * what an IEEE double holds exactly, so a JSON parser that produced numbers here would round
  * somebody's balance without saying so. Use `formatUnits` to show one and `parseUnits` to build one.
  */
+import { PaymosError } from './errors.js';
 
 /** One asset the vault can hold, as the server names it. */
 export interface Asset {
@@ -12,6 +13,13 @@ export interface Asset {
 	readonly symbol: string;
 	readonly chain: string;
 	readonly decimals: number;
+	/**
+	 * Lowercase hex SHA-256 of the asset's raw on-chain id. The co-sign guard hashes the token each
+	 * disclosed transfer moves and refuses unless it matches the send asset's fingerprint. It is the
+	 * server's own statement; pin it with `pinnedFingerprints` for an anchor independent of the
+	 * server. Null from a server too old to publish one — reads still work; a co-sign does not.
+	 */
+	readonly fingerprint: string | null;
 }
 
 /** What the vault holds of one asset. `usd` is a display estimate and may be absent. */
@@ -45,7 +53,7 @@ export interface Amount {
 	readonly asset: string;
 }
 
-/** What arrives. `min` is the floor the operation is allowed to deliver, and it is guaranteed. */
+/** What arrives. `min` is the floor the quote promises to deliver; `minReceive` on `swap` refuses to sign below yours. */
 export interface Receive {
 	readonly amount: string;
 	readonly min: string;
@@ -90,85 +98,117 @@ export interface Movement {
 // ── Wire → model ────────────────────────────────────────────────────────────
 //
 // The server speaks snake_case and the SDK hands back camelCase, so the mapping happens once, here,
-// rather than at every call site. A missing optional becomes null rather than undefined: `null` is
-// what the server means and what JSON round-trips.
+// rather than at every call site. The server OMITS a null field rather than sending `null`, so an
+// optional one is read as absent-or-null and becomes null. A REQUIRED one that is missing is contract
+// drift, and it fails here as a PaymosError — the old behaviour, an empty string, reached BigInt as 0
+// and let a malformed quote read as a free one.
 
-const rec = (v: unknown): Record<string, unknown> => (v ?? {}) as Record<string, unknown>;
-const str = (v: unknown): string => String(v ?? '');
+type Wire = Record<string, unknown>;
+
+const rec = (v: unknown, what: string): Wire => {
+	if (v === null || typeof v !== 'object' || Array.isArray(v)) {
+		throw new PaymosError(`malformed response: ${what} is not an object`);
+	}
+	return v as Wire;
+};
+const req = (o: Wire, key: string, what: string): unknown => {
+	const v = o[key];
+	if (v == null) throw new PaymosError(`malformed response: ${what} has no ${key}`);
+	return v;
+};
+const str = (o: Wire, key: string, what: string): string => String(req(o, key, what));
+const int = (o: Wire, key: string, what: string): number => {
+	const n = Number(req(o, key, what));
+	if (!Number.isInteger(n)) throw new PaymosError(`malformed response: ${what}.${key} is not an integer`);
+	return n;
+};
 const orNull = (v: unknown): string | null => (v == null ? null : String(v));
 
 export const toAsset = (w: unknown): Asset => {
-	const o = rec(w);
-	return { asset: str(o.asset), symbol: str(o.symbol), chain: str(o.chain), decimals: Number(o.decimals ?? 0) };
+	const o = rec(w, 'asset');
+	return {
+		asset: str(o, 'asset', 'asset'),
+		symbol: str(o, 'symbol', 'asset'),
+		chain: str(o, 'chain', 'asset'),
+		decimals: int(o, 'decimals', 'asset'),
+		fingerprint: o.fingerprint == null ? null : String(o.fingerprint).toLowerCase()
+	};
 };
 
 export const toBalance = (w: unknown): Balance => {
-	const o = rec(w);
+	const o = rec(w, 'balance');
 	return {
-		asset: str(o.asset),
-		symbol: str(o.symbol),
-		chain: str(o.chain),
-		decimals: Number(o.decimals ?? 0),
-		amountRaw: str(o.amount_raw ?? o.amountRaw),
+		asset: str(o, 'asset', 'balance'),
+		symbol: str(o, 'symbol', 'balance'),
+		chain: str(o, 'chain', 'balance'),
+		decimals: int(o, 'decimals', 'balance'),
+		amountRaw: str(o, 'amount_raw', 'balance'),
 		usd: orNull(o.usd)
 	};
 };
 
 const toRouteFee = (w: unknown): RouteFee | null => {
 	if (w == null) return null;
-	const o = rec(w);
-	return { amount: str(o.amount), estimate: Boolean(o.estimate) };
+	const o = rec(w, 'fees.route');
+	return { amount: str(o, 'amount', 'fees.route'), estimate: Boolean(o.estimate) };
 };
 
 export const toFees = (w: unknown): Fees | null => {
 	if (w == null) return null;
-	const o = rec(w);
+	const o = rec(w, 'fees');
+	const usd = o.usd == null ? null : rec(o.usd, 'fees.usd');
 	return {
-		asset: str(o.asset),
-		platform: str(o.platform),
-		network: str(o.network),
+		asset: str(o, 'asset', 'fees'),
+		platform: str(o, 'platform', 'fees'),
+		network: str(o, 'network', 'fees'),
 		route: toRouteFee(o.route),
-		total: str(o.total),
-		usd: (o.usd ?? null) as Fees['usd']
+		total: str(o, 'total', 'fees'),
+		usd: usd === null ? null : Object.fromEntries(Object.entries(usd).map(([k, v]) => [k, orNull(v)]))
 	};
 };
 
-const toAmount = (w: unknown): Amount => {
-	const o = rec(w);
-	return { amount: str(o.amount), asset: str(o.asset) };
+const toAmount = (w: unknown, what: string): Amount => {
+	const o = rec(w, what);
+	return { amount: str(o, 'amount', what), asset: str(o, 'asset', what) };
 };
 
-const toReceive = (w: unknown): Receive => {
-	const o = rec(w);
-	return { amount: str(o.amount), min: str(o.min), asset: str(o.asset) };
+const toReceive = (w: unknown, what: string): Receive => {
+	const o = rec(w, what);
+	return { amount: str(o, 'amount', what), min: str(o, 'min', what), asset: str(o, 'asset', what) };
 };
 
 export const toQuote = (w: unknown): Quote => {
-	const o = rec(w);
+	const o = rec(w, 'quote');
+	const sources = o.sources;
+	if (sources != null && !Number.isInteger(Number(sources))) {
+		throw new PaymosError('malformed response: quote.sources is not an integer');
+	}
 	return {
-		movementId: orNull(o.movement_id ?? o.movementId),
-		mode: str(o.mode),
-		send: toAmount(o.send),
-		debit: toAmount(o.debit),
-		receive: toReceive(o.receive),
-		fees: toFees(o.fees) as Fees,
-		expiresAt: str(o.expires_at ?? o.expiresAt),
-		sources: o.sources == null ? null : Number(o.sources)
+		movementId: orNull(o.movement_id),
+		mode: str(o, 'mode', 'quote'),
+		send: toAmount(req(o, 'send', 'quote'), 'quote.send'),
+		debit: toAmount(req(o, 'debit', 'quote'), 'quote.debit'),
+		receive: toReceive(req(o, 'receive', 'quote'), 'quote.receive'),
+		fees: toFees(req(o, 'fees', 'quote')) as Fees,
+		expiresAt: str(o, 'expires_at', 'quote'),
+		// Omitted on a dry preview: there is nothing to sign.
+		sources: sources == null ? null : Number(sources)
 	};
 };
 
 export const toMovement = (w: unknown): Movement => {
-	const o = rec(w);
+	const o = rec(w, 'movement');
 	return {
-		id: str(o.id),
-		type: str(o.type),
-		status: str(o.status),
-		send: toAmount(o.send),
-		receive: toReceive(o.receive),
+		id: str(o, 'id', 'movement'),
+		type: str(o, 'type', 'movement'),
+		status: str(o, 'status', 'movement'),
+		send: toAmount(req(o, 'send', 'movement'), 'movement.send'),
+		receive: toReceive(req(o, 'receive', 'movement'), 'movement.receive'),
+		// A list row carries no fee legs; only the single-movement detail does.
 		fees: toFees(o.fees),
-		destChainTxHash: orNull(o.dest_chain_tx_hash ?? o.destChainTxHash),
-		destChainExplorerUrl: orNull(o.dest_chain_explorer_url ?? o.destChainExplorerUrl),
-		createdAt: str(o.created_at ?? o.createdAt),
-		completedAt: orNull(o.completed_at ?? o.completedAt)
+		destChainTxHash: orNull(o.dest_chain_tx_hash),
+		destChainExplorerUrl: orNull(o.dest_chain_explorer_url),
+		createdAt: str(o, 'created_at', 'movement'),
+		completedAt: orNull(o.completed_at)
 	};
 };

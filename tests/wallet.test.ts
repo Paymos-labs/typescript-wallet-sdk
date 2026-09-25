@@ -14,17 +14,15 @@ import { VaultSecret } from '../dist/secret.js';
 
 const READ_SECRET = VaultSecret.pack('vk_live_abc123', 42, null);
 
+// A list row as the server sends it: null fields are OMITTED, not sent as null — no fees, no
+// tx hash, no completed_at. See sdk/contract/fixtures/movements_page.json.
 const MOVEMENT_ROW = {
 	id: 'mov_1',
 	type: 'swap',
 	status: 'completed',
 	send: { amount: '1000000', asset: 'USDC@base' },
 	receive: { amount: '990000', min: '985000', asset: 'ETH@arb' },
-	fees: null,
-	dest_chain_tx_hash: null,
-	dest_chain_explorer_url: null,
-	created_at: '2026-08-19T00:00:00Z',
-	completed_at: null
+	created_at: '2026-08-19T00:00:00Z'
 };
 
 const walletOver = (handler: (url: string) => unknown) =>
@@ -45,7 +43,8 @@ test('movements returns the keyset page and its cursor', async () => {
 });
 
 test('movements reports the end of the history as a null cursor', async () => {
-	const w = walletOver(() => ({ items: [], next_cursor: null }));
+	// The last page has no next_cursor at all: the server omits a null rather than sending it.
+	const w = walletOver(() => ({ items: [] }));
 	const page = await w.movements();
 	assert.deepEqual(page.items, []);
 	assert.equal(page.nextCursor, null);
@@ -60,6 +59,6 @@ test('wait returns on every terminal status, not just two of them', async () => 
 });
 
 test('wait times out on a movement that never settles', async () => {
-	const w = walletOver(() => ({ ...MOVEMENT_ROW, status: 'relaying' }));
+	const w = walletOver(() => ({ ...MOVEMENT_ROW, status: 'processing' }));
 	await assert.rejects(w.wait('mov_1', { timeoutMs: 5, intervalMs: 1 }), /timed out/);
 });

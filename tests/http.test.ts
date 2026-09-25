@@ -25,7 +25,9 @@ const stub = (status: number, body: unknown, headers: Record<string, string> = {
 	});
 
 test('returns parsed json on a 2xx', async () => {
-	assert.deepEqual(await stub(200, { assets: [] }).get('/x'), { assets: [] });
+	// /assets and /balances answer a bare array; there was never an `{assets: [...]}` wrapper.
+	const body = [{ asset: 'USDC@base', symbol: 'USDC', chain: 'base', decimals: 6 }];
+	assert.deepEqual(await stub(200, body).get('/x'), body);
 });
 
 test('maps status codes to types', async () => {
@@ -71,6 +73,20 @@ test('carries Retry-After on a 429 when the server sends one', async () => {
 test('falls back to the raw body when there is no error envelope', async () => {
 	await assert.rejects(stub(500, 'upstream exploded').get('/x'), (e: PaymosError) =>
 		e.message === 'upstream exploded'
+	);
+});
+
+test('a 2xx that is not JSON is a typed error, not a null the caller trips over later', async () => {
+	await assert.rejects(
+		stub(200, '<!doctype html><html><body>Paymos</body></html>', { 'content-type': 'text/html' }).get('/x'),
+		(e: PaymosError) => e instanceof PaymosError && e.status === 200 && /HTML page/.test(e.message)
+	);
+});
+
+test('an HTML error page is summarised, not quoted whole', async () => {
+	const page = `<!doctype html><html>${'x'.repeat(5000)}</html>`;
+	await assert.rejects(stub(404, page).get('/x'), (e: PaymosError) =>
+		e.status === 404 && /HTML page/.test(e.message) && e.message.length < 200
 	);
 });
 
