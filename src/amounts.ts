@@ -8,7 +8,13 @@
 
 const DECIMAL = /^\d+(\.\d+)?$/;
 
-/** `"1.5"`, 6 → `"1500000"`. Rejects anything that is not a non-negative decimal. */
+/**
+ * `"1.5"`, 6 → `"1500000"`. Rejects anything that is not a non-negative decimal.
+ *
+ * For comparing a human figure with a raw amount from a response — never for building an argument
+ * to `quoteSwap`, `quoteWithdraw`, `swap` or `withdraw`, which take the human string itself and let
+ * the server scale it. `withdraw('USDC@base', parseUnits('0.01', 6), to)` sends `'10000'`: 10 000 USDC.
+ */
 export function parseUnits(human: string, decimals: number): string {
 	if (decimals < 0) throw new RangeError('decimals must be >= 0');
 	const s = (human ?? '').trim();
@@ -22,7 +28,7 @@ export function parseUnits(human: string, decimals: number): string {
 	return (BigInt(whole + padded) || 0n).toString();
 }
 
-/** `"1500000"`, 6 → `"1.5"`. Trailing zeros in the fraction are dropped. */
+/** `"1500000"`, 6 → `"1.5"`: a raw amount from a response, as a human decimal. Trailing zeros in the fraction are dropped. */
 export function formatUnits(raw: string, decimals: number): string {
 	const n = BigInt(raw);
 	const sign = n < 0n ? '-' : '';

@@ -10,7 +10,14 @@ const PREFIX = 'vs_live_';
 const b64urlDecode = (s: string): Buffer => Buffer.from(s, 'base64url');
 
 /** Show only the non-secret prefix, so a log line or a stack trace cannot carry a usable key. */
-const mask = (key: string): string => (key ? `${key.slice(0, 8)}…` : '…');
+export const mask = (key: string): string => (key ? `${key.slice(0, 8)}…` : '…');
+
+/**
+ * Node's `util.inspect` — what `console.log` prints an object with — reads this symbol, not
+ * `toString` or `toJSON`, and without it prints every own property. `Symbol.for` reaches it without
+ * importing `node:util`; anywhere else the symbol is simply never consulted.
+ */
+export const INSPECT = Symbol.for('nodejs.util.inspect.custom');
 
 export class VaultSecret {
 	readonly apiKey: string;
@@ -34,6 +41,11 @@ export class VaultSecret {
 
 	toString(): string {
 		return `VaultSecret(apiKey=${mask(this.apiKey)}, vaultId=${this.vaultId}, hasShare=${this.hasShare})`;
+	}
+
+	/** `console.log(secret)` and `util.inspect(secret)`: the same masked line, never the fields. */
+	[INSPECT](): string {
+		return this.toString();
 	}
 
 	static pack(apiKey: string, vaultId: number, share: string | null): string {

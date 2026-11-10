@@ -47,14 +47,31 @@ The secret is a `vs_live_…` string carrying an API key, the vault id, and — 
 co-signing share. A **read** key can list assets, balances, movements and quotes. A **full** key can
 also `swap` and `withdraw`, and it is the only kind that can sign.
 
-`VaultSecret` never renders the share and masks the key, so a stray `console.log` or a stack trace
-cannot carry a usable credential.
+Neither `VaultSecret` nor `Wallet` renders the share or more than the key's `vk_live_` prefix — not
+through `console.log` / `util.inspect`, `JSON.stringify` or `String()` — so a stray log line cannot
+carry a usable credential. (`VaultSecret.apiKey` and `.share` are still yours to read; what you do
+with them after that is yours too.)
 
 ## Amounts
 
-Every amount is a **string of raw integer units**, never a number. A token with 18 decimals runs past
-what a double holds exactly, so a number here would round somebody's balance silently. Use
-`parseUnits('1.5', 6)` to build one and `formatUnits(raw, 6)` to show one.
+**Human decimal strings in, raw integer strings out.** Never a number in either direction.
+
+- Every amount you **pass** — the `amount` of `quoteSwap`, `quoteWithdraw`, `swap` and `withdraw`,
+  and the `minReceive` / `maxDebit` options — is a **human decimal string** in that asset's own
+  units: `'100'`, `'0.5'`, `'0.01'`. The server owns each asset's decimals and scales it. The SDK
+  only checks it against those decimals (digits and at most one dot, no sign, no more fractional
+  digits than the asset has) and sends it as you wrote it.
+- Every amount you **get back** — `amountRaw` on a balance, every leg of a quote or a movement,
+  every fee — is a **string of raw integer units**: `'10000'` is 0.01 of a 6-decimal USDC.
+- `formatUnits(raw, decimals)` turns a raw amount from a response into a human one, for display.
+  `parseUnits(human, decimals)` goes the other way, and is for **comparing** your own human figure
+  with a raw one from a response — `BigInt(parseUnits('99.5', 6)) <= BigInt(quote.receive.min)`.
+  It is **never** for building an argument: `wallet.withdraw('USDC@base', parseUnits('0.01', 6), to)`
+  sends `'10000'`, which the server reads as **10 000 USDC**, and both sides agree on that number,
+  so no check anywhere can tell it from a real 10 000 USDC payout.
+
+Strings because a token with 18 decimals runs past what a double holds exactly: a number here would
+round somebody's balance without saying so.
 
 ## Errors
 
@@ -140,8 +157,11 @@ sign — not the funds.
 
 ### What happens if a transfer is interrupted?
 
-Every money-moving call takes an idempotency key. Repeating a call with the same key returns the
-original operation instead of starting a second one, so a retry after a timeout cannot pay twice.
+Every money-moving call is sent under an idempotency key, and repeating a call with the **same** key
+returns the original operation instead of starting a second one. That holds only if your retry
+carries the same key: pass your own durable one (`idempotencyKey`, e.g. your payout id) and retry
+with it, and a retry after a timeout cannot pay twice. Leave it out and the SDK generates a fresh key
+per call — a retry is then a second payment. An empty key is refused rather than sent.
 
 ## The same wallet, in eight languages
 

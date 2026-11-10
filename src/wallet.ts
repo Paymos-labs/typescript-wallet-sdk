@@ -27,7 +27,8 @@ import { payloadDigestHex } from './digest.js';
 import { PaymosError, SlippageExceeded } from './errors.js';
 import { Http, type HttpOptions } from './http.js';
 import { commit as frostCommit, sign as frostSign } from './mpc.js';
-import { VaultSecret } from './secret.js';
+import { INSPECT, mask, VaultSecret } from './secret.js';
+import { parseStrict } from './strict-json.js';
 import {
 	toAsset,
 	toBalance,
@@ -93,18 +94,30 @@ function normalisePins(pins: WalletOptions['pinnedFingerprints']): Map<string, R
 }
 
 export class Wallet {
-	private readonly secret: VaultSecret;
-	private readonly http: Http;
+	// ES private fields, not TypeScript `private`: `console.log(wallet)`, `util.inspect`,
+	// `JSON.stringify`, `Object.entries` and a spread all walk an object's own properties, and these
+	// two hold the API key and the co-signing share. A # field is not a property at all.
+	readonly #secret: VaultSecret;
+	readonly #http: Http;
 	private readonly pins: Map<string, ReadonlySet<string>>;
 	private assetList: Asset[] | null = null;
 	private assetCache: Map<string, Asset> | null = null;
 
 	constructor(secret: string, options: WalletOptions = {}) {
-		this.secret = VaultSecret.parse(secret);
+		this.#secret = VaultSecret.parse(secret);
 		// `||`, not `??`: an exported-but-empty PAYMOS_BASE_URL must not turn every URL into a bare path.
 		const baseUrl = options.baseUrl || process.env.PAYMOS_BASE_URL || 'https://wallet.paymos.io';
-		this.http = new Http(baseUrl, this.secret.apiKey, options);
+		this.#http = new Http(baseUrl, this.#secret.apiKey, options);
 		this.pins = normalisePins(options.pinnedFingerprints);
+	}
+
+	/** A stray `console.log(wallet)` or `JSON.stringify(wallet)` shows which vault — never its key or share. */
+	toJSON(): Record<string, unknown> {
+		return { vaultId: this.#secret.vaultId, hasShare: this.#secret.hasShare, http: this.#http.toJSON() };
+	}
+
+	[INSPECT](): string {
+		return `Wallet(vaultId=${this.#secret.vaultId}, hasShare=${this.#secret.hasShare}, apiKey=${mask(this.#secret.apiKey)})`;
 	}
 
 	/** Reads `PAYMOS_VAULT_SECRET`, the way a deployed process is configured. */
@@ -122,16 +135,16 @@ export class Wallet {
 	 * failed with "unknown asset". Anything other than an array is refused, never read as empty.
 	 */
 	async assets(): Promise<Asset[]> {
-		return expectArray(await this.http.get('/vault/v1/assets'), '/assets').map(toAsset);
+		return expectArray(await this.#http.get('/vault/v1/assets'), '/assets').map(toAsset);
 	}
 
 	/** The vault's balances — a bare JSON array, like `assets()`. */
 	async balances(): Promise<Balance[]> {
-		return expectArray(await this.http.get('/vault/v1/balances'), '/balances').map(toBalance);
+		return expectArray(await this.#http.get('/vault/v1/balances'), '/balances').map(toBalance);
 	}
 
 	async movement(movementId: string): Promise<Movement> {
-		return toMovement(await this.http.get(`/vault/v1/movements/${encodeURIComponent(movementId)}`));
+		return toMovement(await this.#http.get(`/vault/v1/movements/${encodeURIComponent(movementId)}`));
 	}
 
 	/**
@@ -140,7 +153,7 @@ export class Wallet {
 	 * server speaks keyset pagination: `items` + `next_cursor`.
 	 */
 	async movements(limit = 50, cursor?: string): Promise<{ items: Movement[]; nextCursor: string | null }> {
-		const body = expectObject(await this.http.get('/vault/v1/movements', { limit, cursor }), '/movements');
+		const body = expectObject(await this.#http.get('/vault/v1/movements', { limit, cursor }), '/movements');
 		const items = expectArray(body.items, '/movements items').map(toMovement);
 		const nextCursor = body.next_cursor == null ? null : String(body.next_cursor);
 		return { items, nextCursor };
@@ -162,7 +175,13 @@ export class Wallet {
 
 	// ── quotes ───────────────────────────────────────────────────────────────
 
-	/** A dry preview. Nothing is created and nothing is signed. */
+	/**
+	 * A dry preview. Nothing is created and nothing is signed.
+	 *
+	 * `amount` is a HUMAN decimal string in the send asset (`'100'`, `'0.5'`); the server scales it by
+	 * the asset's decimals. The quote comes back in raw integer strings. Never pass `parseUnits`
+	 * output here: `'10000'` is ten thousand of the asset, not 0.01.
+	 */
 	async quoteSwap(send: string, receive: string, amount: string, slippageBps = 50): Promise<Quote> {
 		requireSlippage(slippageBps);
 		await this.validateAmount(amount, send);
@@ -170,7 +189,12 @@ export class Wallet {
 		return this.quote('/vault/v1/quote/swap', swapBody(send, receive, amount, slippageBps), true);
 	}
 
-	/** A dry preview. Nothing is created and nothing is signed. */
+	/**
+	 * A dry preview. Nothing is created and nothing is signed.
+	 *
+	 * `amount` is a HUMAN decimal string in `asset` (`'25'`, `'0.01'`); the server scales it. The quote
+	 * comes back in raw integer strings. Never pass `parseUnits` output here.
+	 */
 	async quoteWithdraw(asset: string, amount: string, to: string, mode = 'exact_out'): Promise<Quote> {
 		await this.validateAmount(amount, asset);
 		return this.quote('/vault/v1/quote/withdraw', { asset, amount, to, mode }, true);
@@ -178,6 +202,14 @@ export class Wallet {
 
 	// ── money ────────────────────────────────────────────────────────────────
 
+	/**
+	 * Swaps `amount` of `send` for `receive`, delivered back to this vault: a real movement, co-signed.
+	 * Full-key secrets only.
+	 *
+	 * `amount`, `minReceive` and `maxDebit` are HUMAN decimal strings (`'100'`, `'99.5'`) that the
+	 * server scales by each asset's decimals — never `parseUnits` output, which would be read as that
+	 * many whole units: `swap('USDC@base', 'USDT@base', '10000')` swaps ten thousand USDC.
+	 */
 	async swap(
 		send: string,
 		receive: string,
@@ -191,15 +223,11 @@ export class Wallet {
 	): Promise<Movement> {
 		this.requireShare('swap');
 		requireSlippage(slippageBps);
+		const key = idempotencyKeyOf(idempotencyKey);
 		const sendDec = await this.validateAmount(amount, send);
 		const recvDec = await this.decimalsOf(receive);
 
-		const q = await this.quote(
-			'/vault/v1/quote/swap',
-			swapBody(send, receive, amount, slippageBps),
-			false,
-			idempotencyKey ?? crypto.randomUUID().replace(/-/g, '')
-		);
+		const q = await this.quote('/vault/v1/quote/swap', swapBody(send, receive, amount, slippageBps), false, key);
 
 		if (minReceive !== undefined) {
 			const floor = BigInt(parseUnits(minReceive, recvDec));
@@ -216,6 +244,14 @@ export class Wallet {
 		return this.movement(requireMovementId(q));
 	}
 
+	/**
+	 * Pays `amount` of `asset` out to `to`: a real movement, co-signed. Full-key secrets only.
+	 *
+	 * `amount` and `maxDebit` are HUMAN decimal strings (`'25'`, `'0.01'`) that the server scales by
+	 * the asset's decimals — never `parseUnits` output. `withdraw('USDC@base', '10000', to)`, which is
+	 * what `parseUnits('0.01', 6)` returns, pays out ten thousand USDC, and since the SDK and the server
+	 * agree on that number no check can tell it from an intended one.
+	 */
 	async withdraw(
 		asset: string,
 		amount: string,
@@ -227,14 +263,10 @@ export class Wallet {
 		}: { mode?: string; maxDebit?: string; idempotencyKey?: string } = {}
 	): Promise<Movement> {
 		this.requireShare('withdraw');
+		const key = idempotencyKeyOf(idempotencyKey);
 		const dec = await this.validateAmount(amount, asset);
 
-		const q = await this.quote(
-			'/vault/v1/quote/withdraw',
-			{ asset, amount, to, mode },
-			false,
-			idempotencyKey ?? crypto.randomUUID().replace(/-/g, '')
-		);
+		const q = await this.quote('/vault/v1/quote/withdraw', { asset, amount, to, mode }, false, key);
 
 		// A withdraw is same-asset. For exact_out the approved amount is the guaranteed OUT; for
 		// total_in it is the total DEBIT — and the send leg is total minus fees, so pinning send
@@ -251,7 +283,7 @@ export class Wallet {
 	// ── internals ────────────────────────────────────────────────────────────
 
 	private requireShare(op: string): void {
-		if (!this.secret.hasShare) {
+		if (!this.#secret.hasShare) {
 			throw new PaymosError(`${op} needs a full-scope secret: this one carries no co-signing share`);
 		}
 	}
@@ -311,7 +343,7 @@ export class Wallet {
 
 	private async quote(path: string, body: Json, dry: boolean, idempotencyKey?: string): Promise<Quote> {
 		const headers = idempotencyKey ? { 'idempotency-key': idempotencyKey } : undefined;
-		return toQuote(await this.http.post(path, { ...body, dry }, headers));
+		return toQuote(await this.#http.post(path, { ...body, dry }, headers));
 	}
 
 	/**
@@ -381,7 +413,7 @@ export class Wallet {
 		let begin: Json;
 		try {
 			begin = expectObject(
-				await this.http.post(`/vault/v1/movements/${mid}/sign/begin`, { commitments }),
+				await this.#http.post(`/vault/v1/movements/${mid}/sign/begin`, { commitments }),
 				'sign/begin'
 			);
 		} catch (e) {
@@ -406,7 +438,7 @@ export class Wallet {
 		// A 4xx `{ok:false, error}` is raised by the transport; a 2xx that still says `ok:false` is
 		// caught here. Either way a round-two failure always propagates — it is never swallowed.
 		const res = expectObject(
-			await this.http.post(`/vault/v1/movements/${mid}/sign/aggregate`, { token: begin.token, shares }),
+			await this.#http.post(`/vault/v1/movements/${mid}/sign/aggregate`, { token: begin.token, shares }),
 			'sign/aggregate'
 		);
 		if (res.ok !== true) {
@@ -415,8 +447,8 @@ export class Wallet {
 	}
 
 	private clientKeyPackage(): Json {
-		if (this.secret.share === null) throw new PaymosError('this secret carries no co-signing share');
-		return JSON.parse(this.secret.share) as Json;
+		if (this.#secret.share === null) throw new PaymosError('this secret carries no co-signing share');
+		return JSON.parse(this.#secret.share) as Json;
 	}
 }
 
@@ -442,6 +474,22 @@ function expectObject(body: unknown, what: string): Json {
  */
 function swapBody(send: string, receive: string, amount: string, slippageBps: number): Json {
 	return { send, receive, amount, mode: 'exact_in', slippage_bps: slippageBps };
+}
+
+/**
+ * The key a money call is sent under: the caller's, or a fresh one when they passed none. An empty
+ * or blank key is refused. It used to be kept — `'' ?? fresh` is `''` — and then dropped from the
+ * request as falsy, so the call went out with no key at all and a retry paid again, while the
+ * caller believed it was deduplicated.
+ */
+function idempotencyKeyOf(key: string | undefined): string {
+	if (key == null) return crypto.randomUUID().replace(/-/g, '');
+	if (typeof key !== 'string' || !key.trim()) {
+		throw new PaymosError(
+			'idempotencyKey is empty — pass a durable key (a payout or job id) so a retry replays the same movement, or leave it out for a fresh one per call'
+		);
+	}
+	return key;
 }
 
 function requireSlippage(bps: number): void {
@@ -505,10 +553,12 @@ function verifySigningDisclosure(
 			throw new PaymosError(`co-sign refused: signing package ${i} does not bind to the disclosed message`);
 		}
 
-		// (2) structure and own-vault: one transfer, signed from this vault and no other.
+		// (2) structure and own-vault: one transfer, signed from this vault and no other. Parsed
+		// strictly: the verifier on chain re-parses these exact bytes and rejects a repeated key,
+		// where JSON.parse would quietly keep the last one (strict-json.ts).
 		let parsed: unknown;
 		try {
-			parsed = JSON.parse(message);
+			parsed = parseStrict(message);
 		} catch (e) {
 			throw new PaymosError(`co-sign refused: unreadable message for source ${i}: ${(e as Error).message}`);
 		}

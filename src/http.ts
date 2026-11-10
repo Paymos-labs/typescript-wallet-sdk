@@ -24,6 +24,7 @@ import {
 	RouteUnavailable,
 	SlippageExceeded
 } from './errors.js';
+import { INSPECT, mask } from './secret.js';
 
 /** The sign/aggregate round can trigger a relay that takes a while. */
 const DEFAULT_TIMEOUT_MS = 60_000;
@@ -95,19 +96,29 @@ export interface HttpOptions {
 
 export class Http {
 	private readonly baseUrl: string;
-	private readonly apiKey: string;
+	/** An ES private field: not an own property, so nothing that walks properties can print it. */
+	readonly #apiKey: string;
 	private readonly timeoutMs: number;
 	private readonly doFetch: typeof globalThis.fetch;
 
 	constructor(baseUrl: string, apiKey: string, options: HttpOptions = {}) {
 		this.baseUrl = baseUrl.replace(/\/+$/, '');
-		this.apiKey = apiKey;
+		this.#apiKey = apiKey;
 		this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 		this.doFetch = options.fetch ?? globalThis.fetch;
 	}
 
+	/** Printed or serialized, the transport shows where it points — never the key it sends. */
+	toJSON(): Record<string, unknown> {
+		return { baseUrl: this.baseUrl, apiKey: mask(this.#apiKey) };
+	}
+
+	[INSPECT](): string {
+		return `Http(baseUrl=${this.baseUrl}, apiKey=${mask(this.#apiKey)})`;
+	}
+
 	private headers(extra?: Record<string, string>): Record<string, string> {
-		return { authorization: `Bearer ${this.apiKey}`, ...(extra ?? {}) };
+		return { authorization: `Bearer ${this.#apiKey}`, ...(extra ?? {}) };
 	}
 
 	private async send(path: string, init: RequestInit): Promise<unknown> {

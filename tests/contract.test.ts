@@ -24,6 +24,7 @@ import { VaultSecret } from '../dist/secret.js';
 import { payloadDigestHex } from '../dist/digest.js';
 import { toQuote } from '../dist/types.js';
 import { AuthError, Conflict, Forbidden, PaymosError } from '../dist/errors.js';
+import { parseStrict } from '../dist/strict-json.js';
 
 // ── fixtures ────────────────────────────────────────────────────────────────
 
@@ -179,12 +180,15 @@ interface Plan {
 	signer?: string;
 	/** Hash a different message into the package than the one disclosed. */
 	swapMessage?: boolean;
+	/** The disclosed message, written out verbatim — for bytes JSON.stringify would never produce. */
+	raw?: string;
 }
 
 const NONCE_HEX = Buffer.from(Array.from({ length: 32 }, (_, i) => i)).toString('hex');
 const RECIPIENT = 'recipient.example';
 
 const transferMessage = (p: Plan) =>
+	p.raw ??
 	JSON.stringify({
 		signer_id: p.signer ?? VAULT,
 		deadline: '2026-01-01T00:00:00.000Z',
@@ -599,6 +603,67 @@ test('blind-sign guard: every per-source amount is ASCII digits and above zero',
 		await assert.rejects(run(), /bad transfer amount for source 0/, `amount ${JSON.stringify(amount)}`);
 		assert.equal(find(seen, 'POST', `/vault/v1/movements/${mid}/sign/aggregate`).length, 0);
 	}
+});
+
+test('blind-sign guard: a message that repeats a key is refused — never read as its last value', async () => {
+	// Read with JSON.parse — last key wins — each of these is one honest-looking transfer within the
+	// debit. The verifier on chain re-parses the signed bytes and rejects a repeated key.
+	const real = `{"intent":"transfer","receiver_id":"attacker.example","tokens":{"usdc-base":"5000000000"}}`;
+	const decoy = `{"intent":"transfer","receiver_id":"solver.example","tokens":{"usdc-base":"${AMOUNT}"}}`;
+	for (const raw of [
+		`{"signer_id":"${VAULT}","intents":[${real}],"intents":[${decoy}]}`,
+		`{"signer_id":"${VAULT}","intents":[${real}],"\\u0069ntents":[${decoy}]}`,
+		`{"signer_id":"f${VAULT.slice(1)}","intents":[${decoy}],"signer_id":"${VAULT}"}`,
+		`{"signer_id":"${VAULT}","intents":[{"intent":"transfer","tokens":{"usdc-base":"5000000000","usdc-base":"${AMOUNT}"}}]}`,
+		`{"signer_id":"${VAULT}","intents":[${decoy}],"memo":{"a":1,"a":2}}`
+	]) {
+		assert.equal((JSON.parse(raw) as { intents: unknown[] }).intents.length, 1);
+		const { run, seen, mid } = swapRound([{ amount: AMOUNT, raw }], load('sign_aggregate').response);
+		await assert.rejects(run(), /co-sign refused: unreadable message for source 0: duplicate key/, raw);
+		assert.equal(find(seen, 'POST', `/vault/v1/movements/${mid}/sign/aggregate`).length, 0);
+	}
+	// "Intents" is another key to JSON.parse and to the verifier alike: the guard reads "intents".
+	const { run } = swapRound(
+		[{ amount: AMOUNT, raw: `{"signer_id":"${VAULT}","intents":[${real}],"Intents":[${decoy}]}` }],
+		load('sign_aggregate').response
+	);
+	await assert.rejects(run(), /above the approved debit/);
+});
+
+test('blind-sign guard: a message nested a million deep is a refusal, and an ordinary depth signs', async () => {
+	const decoy = `{"intent":"transfer","receiver_id":"solver.example","tokens":{"usdc-base":"${AMOUNT}"}}`;
+	const nest = (n: number) => '['.repeat(n) + ']'.repeat(n);
+	const deep = swapRound([{ amount: AMOUNT, raw: `{"signer_id":"${VAULT}","intents":[${decoy}],"memo":${nest(1_000_000)}}` }], load('sign_aggregate').response);
+	await assert.rejects(deep.run(), /co-sign refused: unreadable message for source 0: nested deeper than 64 levels/);
+	assert.equal(find(deep.seen, 'POST', `/vault/v1/movements/${deep.mid}/sign/aggregate`).length, 0);
+	const ordinary = swapRound([{ amount: AMOUNT, raw: `{"signer_id":"${VAULT}","intents":[${decoy}],"memo":${nest(8)}}` }], load('sign_aggregate').response);
+	assert.equal((await ordinary.run()).id, ordinary.mid);
+});
+
+test('strict JSON: every recorded fixture, and the message sign_begin discloses, parse strictly', () => {
+	for (const name of COVERED) parseStrict(readFileSync(join(FIXTURES!, `${name}.json`), 'utf8'));
+	for (const d of load('sign_begin').response.body.messages) parseStrict(d.message);
+	for (const bad of ['{"a":1,"a":2}', '[{"k":{"x":1,"x":1}}]', '{"\\u0061":1,"a":2}']) assert.throws(() => parseStrict(bad), PaymosError);
+	assert.deepEqual(parseStrict('{"a":"\\"b\\":1","b":[{"a":1}],"A":2}'), { a: '"b":1', b: [{ a: 1 }], A: 2 });
+});
+
+test('idempotency: an empty key is refused before anything reaches the server; an omitted one is fresh', async () => {
+	// '' used to survive `?? fresh` and then be dropped from the request as falsy: no key at all.
+	const { wallet, seen } = fullWallet({});
+	for (const idempotencyKey of ['', ' ', '\t']) {
+		await assert.rejects(wallet.withdraw('USDC@base', '10', '0xabc', { idempotencyKey }), /idempotencyKey is empty/);
+		await assert.rejects(wallet.swap('USDC@base', 'USDT@base', '5', { idempotencyKey }), /idempotencyKey is empty/);
+	}
+	assert.equal(seen.length, 0, 'nothing reached the server');
+
+	const f = load('quote_withdraw');
+	const keys: string[] = [];
+	for (let i = 0; i < 2; i++) {
+		const run = fullWallet(Object.fromEntries([route(load('assets')), route(f)]));
+		await assert.rejects(run.wallet.withdraw(f.request.body.asset, f.request.body.amount, f.request.body.to)); // stops at sign/begin
+		keys.push(find(run.seen, 'POST', f.request.path)[0]!.headers.get('idempotency-key')!);
+	}
+	assert.ok(keys[0] && keys[1] && keys[0] !== keys[1], 'an omitted key is a fresh one per call');
 });
 
 test('co-sign: a send asset with no published fingerprint refuses before any commitment', async () => {
